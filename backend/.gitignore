@@ -1,0 +1,10 @@
+/target
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+!.env.local.example
+
+# Local development files
+*.log

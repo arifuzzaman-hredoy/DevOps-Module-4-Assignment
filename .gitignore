@@ -1,0 +1,26 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+!.env.local.example
+!.env.compose.example
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.local.example
+!**/.env.compose.example
+
+# Rust
+backend/target/
+
+# Node/Vite
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+frontend/.vite/
+
+# Editors and logs
+.vscode/
+*.log
+*.swp
+Thumbs.db
