@@ -1,118 +1,770 @@
-# Manual Deployment Handoff
+# Nexora — Deployment Guide
 
-This document describes a possible deployment to the existing three-tier AWS architecture. It is an operator guide only: no AWS resources, servers, DNS, certificates, or security groups have been accessed or changed, and no deployment has been performed. Validate all values, commands, and procedures against the target environment before use.
+## 1. Overview
 
-## Assignment Readiness Checklist
+This document describes the deployment process and production configuration of the Nexora application on Amazon Web Services (AWS).
 
-| Requirement | Status |
+The deployment uses a three-tier architecture:
+
+- Web Tier: Nginx and React frontend.
+- Application Tier: Rust/Axum backend.
+- Database Tier: PostgreSQL 16.
+
+The infrastructure was configured manually using AWS Console, AWS CLI, and SSH.
+
+**Production URL:** https://nexora.oxytumzone.com
+
+**AWS Region:** `ap-southeast-2` (Sydney)
+
+**Operating System:** Ubuntu 24.04 LTS
+
+> This document records the deployment architecture and operational procedures. It is not an automated provisioning script. Review the actual AWS configuration before repeating any infrastructure changes.
+
+---
+
+## 2. Prerequisites
+
+Required tools and access:
+
+- AWS account with appropriate permissions.
+- AWS Console access.
+- AWS CLI.
+- SSH client.
+- Ubuntu 24.04 LTS EC2 instances.
+- Domain name with DNS management access.
+- SSH private key for the EC2 instances.
+- Git.
+
+### Local Environment
+
+The SSH private key is stored locally and must have restricted permissions.
+
+Example:
+
+```bash
+chmod 400 ~/.ssh/nexora-key.pem
+```
+
+Never commit private keys, passwords, environment files, or database credentials to Git.
+
+---
+
+## 3. AWS Infrastructure Setup
+
+### 3.1 Create VPC
+
+Create a custom VPC with the following configuration:
+
+| Property | Value |
 |---|---|
-| Web, App, and Database tier responsibilities | Documented target design; local app tiers run in Compose |
-| Public Web EC2, private App EC2, private Database EC2 | Not provisioned or verified |
-| VPC and public/private subnet separation | Not configured or verified |
-| Route tables, Internet Gateway, and NAT Gateway | Not configured or verified |
-| Security groups and tier-to-tier rules | Intended relationships documented; AWS rules not configured or verified |
-| SSH access | Not configured or accessed |
-| Nginx `/api/` reverse proxy | Local proxy configured and verified; AWS proxy not deployed |
-| Backend, PostgreSQL, frontend integration | Locally implemented and verified |
-| SQLx migrations | Locally executed; not applied to AWS |
-| AWS deployment, DNS, and HTTPS | Not completed or verified |
-| Assignment screenshots/evidence | `screenshots/` is present but empty; no AWS evidence is available in this repository |
+| Name | `nexora-vpc` |
+| CIDR | `10.30.0.0/16` |
+| Region | `ap-southeast-2` |
 
-This status covers the requirements supplied for this review. A separate original assignment rubric was not found in the repository; confirm any additional rubric-specific deliverables before submission.
+### 3.2 Create Subnets
 
-## Target Architecture and Network
+Create three subnets:
 
-- **Web EC2 (public):** Nginx serves the built React assets and proxies `/api/` to the private App EC2.
-- **App EC2 (private):** Rust/Axum listens on port 3000 and connects to PostgreSQL over port 5432.
-- **Database EC2 (private):** PostgreSQL 16 accepts connections only from the App tier and approved administration paths.
+| Subnet | CIDR | Purpose |
+|---|---|---|
+| `nexora-public-subnet` | `10.30.1.0/24` | Web |
+| `nexora-app-subnet` | `10.30.2.0/24` | Backend |
+| `nexora-db-subnet` | `10.30.3.0/24` | Database |
 
-Configure security groups so the Web tier receives only intended public HTTP/HTTPS traffic, the App tier accepts port 3000 only from the Web security group (plus explicitly approved operations), and the Database tier accepts port 5432 only from the App security group. Do not expose app or database ports publicly. The frontend uses same-origin `/api/` routes and needs no public backend address or API secret.
+All three subnets are in Availability Zone `ap-southeast-2a`.
 
-## Database Tier
+Enable automatic public IPv4 assignment only for the public subnet.
 
-Install and harden PostgreSQL 16 according to the operator's standards. Create the application role interactively so its password is not embedded in shell history:
+### 3.3 Configure Gateways
 
-```bash
-sudo -u postgres psql
-```
-
-```sql
-CREATE ROLE nexora_app LOGIN;
-\password nexora_app
-CREATE DATABASE nexora OWNER nexora_app;
-\q
-```
-
-Configure PostgreSQL TLS using a trusted CA and a server certificate whose SAN matches the private DNS hostname used by the app. Restrict PostgreSQL listening addresses and `pg_hba.conf` to approved sources. Rehearse schema changes and backup/restore on a restored copy first; see [Database and migration notes](DATABASE.md).
-
-## App Tier
-
-Build the Linux release binary for the target OS/architecture from a reviewed checkout:
-
-```bash
-cd backend
-cargo build --locked --release
-```
-
-Install the binary and migrations in a protected application directory, or build/deploy only the backend image from `backend/Dockerfile`. Do not deploy the local PostgreSQL, frontend, or public Nginx Compose services on the App EC2.
-
-Supply settings through an approved secret-management mechanism, not a repository `.env` or image layer. Typical production settings:
+Create and attach an Internet Gateway:
 
 ```text
-DB_HOST=<private-db-dns-name-matching-certificate>
-DB_PORT=5432
-DB_NAME=nexora
-DB_USER=nexora_app
-DB_PASSWORD=<supplied-out-of-band>
-DB_SSL_MODE=verify-full
-DB_SSL_ROOT_CERT=/etc/nexora/certs/postgresql-ca.pem
-APP_ENV=production
-SESSION_COOKIE_SECURE=true
-SESSION_TTL_HOURS=24
-TRUST_PROXY_HEADERS=true
-RUST_LOG=info
+nexora-igw
 ```
 
-Install the verified CA read-only. Keep port 3000 private. Enable `TRUST_PROXY_HEADERS=true` only when the App tier accepts traffic exclusively from the trusted Web proxy and that proxy overwrites `X-Real-IP`. The built-in login limiter is per-process; use shared or edge rate limiting when needed for multiple instances.
+Create a NAT Gateway in the public subnet:
 
-For a systemd deployment, review and adapt a unit with a dedicated unprivileged user, protected environment file, restart policy, and filesystem hardening. Do not install/reload services until the binary, secret delivery, database connectivity, and migration plan have been reviewed. Backend startup applies pending SQLx migrations before accepting requests.
+```text
+nexora-nat
+```
 
-## Web Tier, Nginx, DNS, and HTTPS
+The NAT Gateway provides outbound internet connectivity to the private Application subnet.
 
-Build the frontend in `frontend/`:
+### 3.4 Configure Route Tables
+
+Configure the route tables as follows:
+
+**Public Route Table**
+
+| Destination | Target |
+|---|---|
+| `10.30.0.0/16` | Local |
+| `0.0.0.0/0` | Internet Gateway |
+
+**Application Route Table**
+
+| Destination | Target |
+|---|---|
+| `10.30.0.0/16` | Local |
+| `0.0.0.0/0` | NAT Gateway |
+
+**Database Route Table**
+
+| Destination | Target |
+|---|---|
+| `10.30.0.0/16` | Local |
+
+The Database subnet has no default internet route.
+
+---
+
+## 4. Security Group Configuration
+
+Create three Security Groups.
+
+### Web Security Group
+
+| Type | Protocol | Port | Source |
+|---|---|---:|---|
+| HTTP | TCP | 80 | `0.0.0.0/0` |
+| HTTPS | TCP | 443 | `0.0.0.0/0` |
+| SSH | TCP | 22 | Restricted administrative CIDR |
+
+### Application Security Group
+
+| Type | Protocol | Port | Source |
+|---|---|---:|---|
+| Custom TCP | TCP | 3000 | Web Security Group |
+| SSH | TCP | 22 | Web Security Group |
+
+### Database Security Group
+
+| Type | Protocol | Port | Source |
+|---|---|---:|---|
+| PostgreSQL | TCP | 5432 | App Security Group |
+| SSH | TCP | 22 | App Security Group |
+
+This configuration prevents direct public access to the backend and database servers.
+
+---
+
+## 5. EC2 Instance Deployment
+
+Launch three EC2 instances using Ubuntu 24.04 LTS.
+
+| Instance | Subnet | Private IP | Public IP |
+|---|---|---|---|
+| `nexora-web` | Public | `10.30.1.217` | `32.236.75.43` |
+| `nexora-app` | App | `10.30.2.82` | None |
+| `nexora-db` | Database | `10.30.3.195` | None |
+
+Instance type:
+
+```text
+t3.micro
+```
+
+Attach the corresponding Security Group to each instance.
+
+The Web instance uses an Elastic IP so the production DNS record can point to a stable public address.
+
+---
+
+## 6. SSH Access Configuration
+
+The Web instance acts as the SSH entry point for private instances.
+
+Example SSH configuration:
+
+```sshconfig
+Host nexora-web
+    HostName 32.236.75.43
+    User ubuntu
+    IdentityFile ~/.ssh/nexora-key.pem
+    IdentitiesOnly yes
+
+Host nexora-app
+    HostName 10.30.2.82
+    User ubuntu
+    IdentityFile ~/.ssh/nexora-key.pem
+    IdentitiesOnly yes
+    ProxyJump nexora-web
+
+Host nexora-db
+    HostName 10.30.3.195
+    User ubuntu
+    IdentityFile ~/.ssh/nexora-key.pem
+    IdentitiesOnly yes
+    ProxyJump nexora-app
+```
+
+### Connect to Web
 
 ```bash
-npm ci
-npm run typecheck
-npm run lint
-npm test
-npm run build
+ssh nexora-web
 ```
 
-Copy only `frontend/dist/` to `/var/www/nexora/` on the Web EC2. Install Nginx and `envsubst` using the host's approved package source. Choose `nginx/nexora-http.conf.template` only if TLS terminates elsewhere; otherwise use `nginx/nexora-https.conf.template` with externally managed certificates and renewal.
-
-From the project root, render the HTTP template with only its intended variables:
+### Connect to Application
 
 ```bash
-export NEXORA_DOMAIN='your-domain.example'
-export NEXORA_APP_HOST='private-app-hostname'
-envsubst '${NEXORA_DOMAIN} ${NEXORA_APP_HOST}' \
-  < nginx/nexora-http.conf.template \
-  | sudo tee /etc/nginx/sites-available/nexora.conf >/dev/null
+ssh nexora-app
 ```
 
-For the HTTPS template, also set `NEXORA_TLS_CERT` and `NEXORA_TLS_KEY`, and pass all four placeholders explicitly to `envsubst`. Do not run an unrestricted `envsubst`; it would replace Nginx's `$host`, `$remote_addr`, `$scheme`, and `$request_uri` variables.
+### Connect to Database
 
-Review the rendered file, enable it according to the host's Nginx layout, and run `sudo nginx -t` before an operator-controlled reload. Point DNS to the Web tier only after the Web configuration and certificate are ready. No production Nginx template, DNS, or certificate has been validated by this project.
+```bash
+ssh nexora-db
+```
 
-The templates route `/api/` to `${NEXORA_APP_HOST}:3000`, set forwarding headers, support SPA fallback, and apply basic security headers. They cap request bodies at 1 MiB; the backend JSON limit is 64 KiB.
+The private key must remain protected on the administrator's local machine.
 
-## Rollout, Health, and Rollback
+---
 
-1. Review the release, dependencies, configuration, migration list, and security-group plan.
-2. Take and verify a restorable PostgreSQL backup. Migration `0003` stops if legacy tasks exist; resolve that rollout blocker using the reviewed ownership-migration plan in [Database notes](DATABASE.md). Never silently assign or discard tasks.
-3. Roll out the Database, App, and Web changes using the organization's approved change process.
-4. On the App host, verify `http://127.0.0.1:3000/health` and `/ready`. From an approved client, verify the HTTPS Web URL and exercise registration, login/logout, and disposable task CRUD, including ownership boundaries.
-5. Preserve previous application/frontend artifacts and a verified database recovery path. Roll back application artifacts separately from schema. Migrations are forward-only; never delete the database or volume as a rollback strategy.
+## 7. Linux Server Preparation
 
-Deployment, SSH/transfer, AWS configuration, production tests, backup scheduling, TLS issuance, and rollback have not been performed or verified here. See [Troubleshooting](TROUBLESHOOTING.md) for local-only Compose troubleshooting.
+Run the following commands on the appropriate Ubuntu EC2 instances.
+
+Update package information:
+
+```bash
+sudo apt update
+```
+
+Upgrade installed packages:
+
+```bash
+sudo apt upgrade -y
+```
+
+Install commonly required utilities:
+
+```bash
+sudo apt install -y curl wget git unzip ca-certificates
+```
+
+Check operating system:
+
+```bash
+cat /etc/os-release
+```
+
+Check available disk space:
+
+```bash
+df -h
+```
+
+Check memory:
+
+```bash
+free -h
+```
+
+---
+
+## 8. Database Deployment
+
+The Database Tier uses PostgreSQL 16 on a private EC2 instance.
+
+### 8.1 Install PostgreSQL
+
+Install PostgreSQL using the configured Ubuntu package source.
+
+```bash
+sudo apt update
+sudo apt install -y postgresql postgresql-contrib
+```
+
+Check service status:
+
+```bash
+sudo systemctl status postgresql
+```
+
+Enable the service at boot:
+
+```bash
+sudo systemctl enable postgresql
+```
+
+### 8.2 Database Configuration
+
+The deployment uses:
+
+| Property | Value |
+|---|---|
+| Database | `nexora` |
+| Application Role | `nexora_app` |
+| PostgreSQL Port | `5432` |
+| Database Private IP | `10.30.3.195` |
+
+The application role should have only the database permissions required by the application.
+
+Database credentials must be stored securely and must never be included in this documentation.
+
+### 8.3 Configure Network Access
+
+PostgreSQL must listen on the required private network interface.
+
+The PostgreSQL host-based authentication configuration must permit the Application EC2 private IP:
+
+```text
+10.30.2.82/32
+```
+
+Use SCRAM authentication for the application database role.
+
+The Database Security Group permits TCP port `5432` only from the App Security Group.
+
+### 8.4 Verify PostgreSQL
+
+```bash
+sudo systemctl is-active postgresql
+```
+
+Check the listening port:
+
+```bash
+sudo ss -lntp | grep 5432
+```
+
+Check PostgreSQL readiness:
+
+```bash
+sudo -u postgres pg_isready
+```
+
+---
+
+## 9. Backend Deployment
+
+The Application Tier runs a Rust/Axum backend as a systemd service.
+
+### 9.1 Backend Configuration
+
+The backend listens on:
+
+```text
+3000
+```
+
+Database server:
+
+```text
+10.30.3.195
+```
+
+Database port:
+
+```text
+5432
+```
+
+The backend environment file is stored at:
+
+```text
+/etc/nexora/backend.env
+```
+
+This file contains production configuration and sensitive values.
+
+**Never print, copy into Git, or share the contents of this file.**
+
+### 9.2 Environment File Permissions
+
+The production environment file uses restricted ownership and permissions:
+
+```text
+Owner: root
+Group: nexora
+Mode: 640
+```
+
+Verify permissions without displaying its contents:
+
+```bash
+sudo stat -c '%U:%G %a %n' /etc/nexora/backend.env
+```
+
+### 9.3 Backend Service
+
+The backend binary is installed at:
+
+```text
+/usr/local/bin/nexora-backend
+```
+
+The systemd service is:
+
+```text
+nexora-backend.service
+```
+
+Check service status:
+
+```bash
+sudo systemctl status nexora-backend
+```
+
+Check whether the service is active:
+
+```bash
+sudo systemctl is-active nexora-backend
+```
+
+View recent logs:
+
+```bash
+sudo journalctl -u nexora-backend -n 50 --no-pager
+```
+
+Follow logs:
+
+```bash
+sudo journalctl -u nexora-backend -f
+```
+
+Check application readiness:
+
+```bash
+curl -i http://127.0.0.1:3000/ready
+```
+
+Expected result:
+
+```text
+HTTP/1.1 200 OK
+```
+
+The readiness response should indicate that the backend and its database dependency are ready.
+
+---
+
+## 10. Frontend Deployment
+
+The React frontend is served from the Web EC2 instance.
+
+Production release directory:
+
+```text
+/var/www/nexora/releases/20261106-frontend-v1
+```
+
+Nginx serves the frontend static files.
+
+Verify that the frontend release directory exists:
+
+```bash
+sudo ls -la /var/www/nexora/releases/
+```
+
+The Web Tier must be able to serve the application homepage over HTTPS.
+
+---
+
+## 11. Nginx Configuration
+
+Nginx runs on the Web EC2 instance.
+
+### 11.1 Install Nginx
+
+```bash
+sudo apt update
+sudo apt install -y nginx
+```
+
+Enable and start Nginx:
+
+```bash
+sudo systemctl enable nginx
+sudo systemctl start nginx
+```
+
+Check status:
+
+```bash
+sudo systemctl status nginx
+```
+
+### 11.2 Site Configuration
+
+Configuration file:
+
+```text
+/etc/nginx/sites-available/nexora
+```
+
+The Nginx configuration serves the React frontend and forwards API requests to the private backend.
+
+Backend target:
+
+```text
+http://10.30.2.82:3000
+```
+
+The `/api/` location must proxy requests to the backend without unintentionally removing the API path prefix.
+
+### 11.3 Validate Nginx
+
+Test the configuration:
+
+```bash
+sudo nginx -t
+```
+
+Reload Nginx after a successful configuration test:
+
+```bash
+sudo systemctl reload nginx
+```
+
+Check service status:
+
+```bash
+sudo systemctl is-active nginx
+```
+
+---
+
+## 12. DNS Configuration
+
+Production hostname:
+
+```text
+nexora.oxytumzone.com
+```
+
+DNS record:
+
+| Record | Name | Value |
+|---|---|---|
+| A | `nexora.oxytumzone.com` | `32.236.75.43` |
+
+The A record points to the Web EC2 Elastic IP.
+
+Verify DNS resolution:
+
+```bash
+dig nexora.oxytumzone.com
+```
+
+Alternative:
+
+```bash
+nslookup nexora.oxytumzone.com
+```
+
+The returned address should match the Web Elastic IP.
+
+---
+
+## 13. SSL/TLS Configuration
+
+The production domain uses Let's Encrypt certificates managed by Certbot.
+
+Install Certbot and the Nginx integration:
+
+```bash
+sudo apt update
+sudo apt install -y certbot python3-certbot-nginx
+```
+
+The certificate was configured for:
+
+```text
+nexora.oxytumzone.com
+```
+
+### 13.1 Verify Certificate
+
+```bash
+sudo certbot certificates
+```
+
+### 13.2 Verify Automatic Renewal
+
+Check the Certbot timer:
+
+```bash
+systemctl status certbot.timer
+```
+
+Test renewal:
+
+```bash
+sudo certbot renew --dry-run
+```
+
+The renewal dry-run completed successfully during deployment.
+
+### 13.3 Verify HTTPS
+
+```bash
+curl -I https://nexora.oxytumzone.com
+```
+
+Expected:
+
+```text
+HTTP/2 200
+```
+
+### 13.4 Verify HTTP Redirect
+
+```bash
+curl -I http://nexora.oxytumzone.com
+```
+
+Expected behavior:
+
+```text
+HTTP/1.1 301 Moved Permanently
+```
+
+The response should redirect to the HTTPS version of the domain.
+
+---
+
+## 14. Application Verification
+
+The production application was tested through the HTTPS domain.
+
+The following functionality was verified:
+
+| Feature | Verification |
+|---|---|
+| Homepage | Successful |
+| User Registration | Successful |
+| User Login | Successful |
+| Dashboard | Successful |
+| Task Creation | Successful |
+| Task Update | Successful |
+| Task Deletion | Successful |
+| API Requests | Successful |
+| Unauthorized API Request | Expected HTTP 401 |
+
+Authentication and task-management operations were tested through the browser.
+
+Sensitive authentication cookies and CSRF tokens must never be included in screenshots or shared logs.
+
+---
+
+## 15. Production Health Checks
+
+Run these checks on the relevant EC2 instances.
+
+### Web Tier
+
+```bash
+sudo systemctl is-active nginx
+```
+
+```bash
+sudo nginx -t
+```
+
+### Application Tier
+
+```bash
+sudo systemctl is-active nexora-backend
+```
+
+```bash
+curl -i http://127.0.0.1:3000/ready
+```
+
+### Database Tier
+
+```bash
+sudo systemctl is-active postgresql
+```
+
+```bash
+sudo -u postgres pg_isready
+```
+
+### Public Endpoint
+
+```bash
+curl -I https://nexora.oxytumzone.com
+```
+
+---
+
+## 16. Deployment Evidence
+
+Screenshots are stored in the repository's `screenshots/` directory.
+
+Evidence includes:
+
+- Production homepage and application functionality.
+- HTTPS redirect and SSL certificate.
+- VPC and subnet configuration.
+- Route tables and Security Groups.
+- EC2 instances and Elastic IP.
+- Database instance and storage.
+- Nginx and backend service status.
+- PostgreSQL status and database connectivity.
+- Certbot renewal verification.
+
+Refer to the project README for the complete screenshot index.
+
+---
+
+## 17. Important Security Notes
+
+- Do not expose backend or database ports publicly.
+- Keep SSH access restricted to trusted administrative sources.
+- Keep production environment files outside the Git repository.
+- Never commit PEM files, credentials, session cookies, or API tokens.
+- Use least-privilege database permissions.
+- Review Security Group rules periodically.
+- Monitor systemd services and application logs.
+- Review AWS billing, especially NAT Gateway and EC2 costs.
+- PostgreSQL `sslmode=require` encrypts database traffic but does not verify server certificate identity. Certificate verification is a recommended future improvement.
+
+---
+
+## 18. Cleanup and Cost Management
+
+AWS resources can continue generating charges even when the application is not actively used.
+
+Before removing infrastructure:
+
+1. Confirm that all required screenshots and documentation have been saved.
+2. Confirm that no further deployment verification is required.
+3. Review the NAT Gateway and Elastic IP resources.
+4. Review EC2 instances and storage volumes.
+5. Remove resources only when they are no longer needed.
+
+**Important:** Do not delete EC2 instances, EBS volumes, Elastic IPs, or NAT Gateway resources without checking their dependencies and confirming that the evidence and application data are backed up.
+
+---
+
+## 19. Deployment Summary
+
+The Nexora production deployment demonstrates:
+
+- Custom AWS VPC design.
+- Public and private subnet separation.
+- Internet Gateway and NAT Gateway configuration.
+- Three-tier EC2 deployment.
+- Security Group-based network isolation.
+- SSH jump-host access.
+- PostgreSQL database administration.
+- Rust/Axum backend deployment with systemd.
+- Nginx reverse proxy configuration.
+- React frontend hosting.
+- DNS configuration.
+- HTTPS certificate management.
+- Production application verification.
+- Technical documentation and deployment evidence.
+
+---
+
+**Project:** Nexora
+**Deployment Model:** Three-Tier AWS Architecture
+**Cloud Provider:** Amazon Web Services
+**Region:** `ap-southeast-2`
+**Operating System:** Ubuntu 24.04 LTS
